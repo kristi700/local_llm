@@ -5,6 +5,7 @@ from vllm import SamplingParams, AsyncEngineArgs
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 
 MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+MAX_HISTORY_SIZE = 3
 
 async def render_prompt(tokenizer, messages):
     return tokenizer.apply_chat_template(
@@ -24,9 +25,13 @@ async def main():
     )
     tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
 
-    sampling = SamplingParams(max_tokens=256, temperature=0.3)
+    sampling = SamplingParams(max_tokens=256, temperature=0.3) # TODO top_p, outputkind etc
 
     convo = [{"role": "system", "content": "You are a helpful assistant."}]
+    summary = ""
+    convo = [
+        {"role": "system", "content": "You are a helpful assistant."}
+    ]
     print("Type /reset, /exit. Streaming enabled.\n")
 
     while True:
@@ -41,11 +46,18 @@ async def main():
             break
         if user == "/reset":
             convo = [{"role": "system", "content": "You are a helpful assistant."}]
+            summary = ""
             print("History cleared.\n")
             continue
 
-        convo.append({"role": "user", "content": user})
-        prompt = await render_prompt(tokenizer, convo)
+        conversation_with_summary = convo.copy()
+        if summary:
+            conversation_with_summary.insert(
+                1, {"role": "system", "content": f"Summary of previous conversation: {summary}"}
+            )
+
+        conversation_with_summary.append({"role": "user", "content": user})
+        prompt = await render_prompt(tokenizer, conversation_with_summary)
 
         rid = f"chat-{uuid.uuid4()}"
         print("Assistant: ", end="", flush=True)
@@ -62,7 +74,30 @@ async def main():
             last_len = len(cur)
             full = cur
 
+        convo.append({"role": "user", "content": user})
         convo.append({"role": "assistant", "content": full})
+
+        # stg is wrong /w summarization - need to get debugging work / vllm
+        if len(convo) > MAX_HISTORY_SIZE * 2:
+            messages_to_summarize = []
+            for m in convo:
+                if m["role"] in ("user", "assistant"):
+                    messages_to_summarize.append(m)
+            summary_prompt = f"Summarize the following conversation:\n"
+            for m in messages_to_summarize[-MAX_HISTORY_SIZE*2:]:
+                summary_prompt += f"{m['role'].capitalize()}: {m['content']}\n"
+            summary_text = ""
+            async for summary_out in engine.generate(
+                prompt=summary_prompt,
+                sampling_params=sampling,
+                request_id=f"summary-{uuid.uuid4()}",
+            ):
+                summary_text = summary_out.outputs[0].text
+            summary = summary_text.strip()
+            system_msgs = [m for m in convo if m["role"] == "system"]
+            dialog_msgs = [m for m in convo if m["role"] in ("user", "assistant")]
+            dialog_msgs = dialog_msgs[-MAX_HISTORY_SIZE*2:]
+            convo = system_msgs + dialog_msgs
 
 if __name__ == "__main__":
     asyncio.run(main())
