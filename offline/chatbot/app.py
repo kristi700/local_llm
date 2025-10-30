@@ -1,67 +1,68 @@
-from vllm import LLM, EngineArgs
-from vllm.utils import FlexibleArgumentParser
+import asyncio, uuid
 
+from transformers import AutoTokenizer
+from vllm import SamplingParams, AsyncEngineArgs
+from vllm.engine.async_llm_engine import AsyncLLMEngine
 
-def create_parser():
-    parser = FlexibleArgumentParser()
-    EngineArgs.add_cli_args(parser)
-    parser.set_defaults(model="meta-llama/Llama-3.2-1B-Instruct",
-                        gpu_memory_utilization=0.8,
-                        max_model_len=2048,
-                        max_num_seqs=32)
-    sampling_group = parser.add_argument_group("Sampling parameters")
-    sampling_group.add_argument("--max-tokens", type=int)
-    sampling_group.add_argument("--temperature", type=float)
-    sampling_group.add_argument("--top-p", type=float)
-    sampling_group.add_argument("--top-k", type=int)
+MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 
-    parser.add_argument("--system", type=str, default="You are a helpful assistant.")
-    return parser
+async def render_prompt(tokenizer, messages):
+    return tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True
+    )
 
-def main(args: dict):
-    max_tokens = args.pop("max_tokens")
-    temperature = args.pop("temperature")
-    top_p = args.pop("top_p")
-    top_k = args.pop("top_k")
-    system = args.pop("system")
+async def main():
+    engine = AsyncLLMEngine.from_engine_args(
+        AsyncEngineArgs(
+            model=MODEL,
+            gpu_memory_utilization=0.8,
+            max_model_len=2048,
+            max_num_seqs=32,
+        )
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
 
-    llm = LLM(**args)
+    sampling = SamplingParams(max_tokens=256, temperature=0.3)
 
-    sampling = llm.get_default_sampling_params()
-    sampling.max_tokens = max_tokens
-    if temperature is not None: sampling.temperature = temperature
-    if top_p is not None: sampling.top_p = top_p
-    if top_k is not None: sampling.top_k = top_k
+    convo = [{"role": "system", "content": "You are a helpful assistant."}]
+    print("Type /reset, /exit. Streaming enabled.\n")
 
-    conversation = [{"role": "system", "content": system}]
+    while True:
+        try:
+            user = input("\nYou: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye!")
+            break
+        if not user:
+            continue
+        if user == "/exit":
+            break
+        if user == "/reset":
+            convo = [{"role": "system", "content": "You are a helpful assistant."}]
+            print("History cleared.\n")
+            continue
 
-    print("Chat ready. Type your message.")
-    print("Commands: /reset (clear history), /exit (quit)\n")
+        convo.append({"role": "user", "content": user})
+        prompt = await render_prompt(tokenizer, convo)
 
-    try:
-        while True:
-            user = input("You: ").strip()
-            if not user:
-                continue
-            if user == "/exit":
-                break
-            if user == "/reset":
-                conversation = [{"role": "system", "content": system}]
-                print("History cleared.\n")
-                continue
+        rid = f"chat-{uuid.uuid4()}"
+        print("Assistant: ", end="", flush=True)
+        full = ""
+        last_len = 0
 
-            conversation.append({"role": "user", "content": user})
+        async for out in engine.generate(
+            prompt=prompt,
+            sampling_params=sampling,
+            request_id=rid,
+        ):
+            cur = out.outputs[0].text
+            print(cur[last_len:], end="", flush=True)
+            last_len = len(cur)
+            full = cur
 
-            outputs = llm.chat(conversation, sampling, use_tqdm=False)
-            reply = outputs[0].outputs[0].text
-            print(f"Assistant: {reply}\n")
-
-            conversation.append({"role": "assistant", "content": reply})
-
-    except (KeyboardInterrupt, EOFError):
-        print("\nBye!")
+        convo.append({"role": "assistant", "content": full})
 
 if __name__ == "__main__":
-    parser = create_parser()
-    args: dict = vars(parser.parse_args())
-    main(args)
+    asyncio.run(main())
